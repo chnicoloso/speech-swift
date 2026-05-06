@@ -85,6 +85,21 @@ public final class KokoroTTSModel {
             for i in 0..<validSamples { audio[i] = ptr[i] }
         }
 
+        // Linear fade-out on the final ~15 ms. Kokoro is non-autoregressive
+        // and the last sample is generally non-zero — when the playback ring
+        // buffer drains to silence (0.0), the sample-level discontinuity
+        // produces an audible click on speakers. Ramping the tail to zero
+        // eliminates it without perceptibly truncating the audio.
+        let fadeSamples = min(validSamples, Int(0.015 * Double(config.sampleRate)))
+        if fadeSamples >= 2 {
+            let start = validSamples - fadeSamples
+            let denom = Float(fadeSamples - 1)
+            for i in 0..<fadeSamples {
+                let gain = Float(fadeSamples - 1 - i) / denom
+                audio[start + i] *= gain
+            }
+        }
+
         let duration = Double(validSamples) / Double(config.sampleRate)
         let elapsedMs = elapsed * 1000
         AudioLog.inference.info("Kokoro E2E: \(tokenCount) tokens → \(validSamples) samples (\(String(format: "%.1f", duration))s) in \(String(format: "%.0f", elapsedMs))ms")
