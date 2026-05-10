@@ -201,13 +201,15 @@ public final class VibeVoiceTTSModel {
             throw VibeVoiceError.modelNotInitialized(component:
                 "acoustic encoder not present in this checkpoint — Microsoft's "
                 + "VibeVoice-Realtime-0.5B is distributed inference-only and does "
-                + "not include encoder weights. Two ways forward:\n"
-                + "  • To mint a cache from raw audio, pass --long-form on the "
-                + "encode-voice CLI subcommand to encode with VibeVoice-1.5B.\n"
-                + "  • To synthesize with the smaller Realtime-0.5B, start from "
+                + "not include encoder weights. Two real workflows:\n"
+                + "  • Realtime-0.5B synthesis from a custom speaker: start from "
                 + "one of Microsoft's pre-built voice caches at "
                 + "https://github.com/microsoft/VibeVoice/tree/main/demo/voices/streaming_model "
-                + "and convert via scripts/convert_vibevoice_voice.py."
+                + "and convert with scripts/convert_vibevoice_voice.py.\n"
+                + "  • Arbitrary speaker from raw audio: use VibeVoice-1.5B end-to-end "
+                + "via `audio vibevoice ... --long-form --reference-audio <wav> "
+                + "--reference-transcript \"...\"` — that path encodes the reference "
+                + "internally and does not need a precomputed cache."
             )
         }
         let audio: [Float]
