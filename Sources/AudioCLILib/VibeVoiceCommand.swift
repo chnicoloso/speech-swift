@@ -39,10 +39,10 @@ public struct VibeVoiceCommand: ParsableCommand {
     @Option(name: .shortAndLong, help: "Output WAV file path")
     public var output: String = "vibevoice.wav"
 
-    @Option(name: .long, help: "HuggingFace model ID (defaults: VibeVoice-Realtime-0.5B normally, VibeVoice-1.5B with --long-form)")
+    @Option(name: .long, help: "HuggingFace model ID (defaults: aufklarer/VibeVoice-Realtime-0.5B-MLX-INT4 normally, aufklarer/VibeVoice-1.5B-MLX-INT4 with --long-form)")
     public var model: String?
 
-    @Option(name: .long, help: "Qwen2.5 tokenizer model ID (defaults: Qwen2.5-0.5B normally, Qwen2.5-1.5B with --long-form)")
+    @Option(name: .long, help: "Qwen2.5 tokenizer model ID (defaults: Qwen/Qwen2.5-0.5B normally, Qwen/Qwen2.5-1.5B with --long-form)")
     public var tokenizer: String?
 
     @Option(name: .long, help: "DPM-Solver inference steps (higher = better quality, slower)")

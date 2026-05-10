@@ -41,7 +41,7 @@ public struct VibeVoiceEncodeCommand: ParsableCommand {
     @Option(name: .shortAndLong, help: "Output voice cache (.safetensors)")
     public var output: String = "voice.safetensors"
 
-    @Option(name: .long, help: "HuggingFace model ID (default: microsoft/VibeVoice-Realtime-0.5B)")
+    @Option(name: .long, help: "HuggingFace model ID (default: aufklarer/VibeVoice-Realtime-0.5B-MLX-INT4)")
     public var model: String?
 
     @Option(name: .long, help: "Qwen2.5 tokenizer model ID (default: Qwen/Qwen2.5-0.5B)")

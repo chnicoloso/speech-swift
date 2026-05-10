@@ -29,7 +29,7 @@ public final class VibeVoiceTTSModel {
         public var maxSpeechTokens: Int
 
         public init(
-            modelId: String = "microsoft/VibeVoice-Realtime-0.5B",
+            modelId: String = "aufklarer/VibeVoice-Realtime-0.5B-MLX-INT4",
             tokenizerModelId: String = "Qwen/Qwen2.5-0.5B",
             numInferenceSteps: Int = 20,
             cfgScale: Float = 1.3,
