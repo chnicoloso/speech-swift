@@ -39,16 +39,21 @@ The CLI surfaces this in the `audio vibevoice --help` discussion section.
 Realtime-0.5B is **distributed inference-only** — its checkpoint contains
 the LM, TTS LM, connector, decoder, and EOS classifier, but no acoustic
 encoder weights. Calling `audio vibevoice-encode-voice` against this model
-will fail fast with a pointer to the two real workflows:
+will fail fast with a pointer to the only real workflow it can recommend:
 
-1. Start from one of [Microsoft's pre-built `.pt` voice
-   caches](https://github.com/microsoft/VibeVoice/tree/main/demo/voices/streaming_model)
-   and convert via `scripts/convert_vibevoice_voice.py`.
-2. Use 1.5B end-to-end via `audio vibevoice ... --long-form
-   --reference-audio <wav> --reference-transcript "..."` — the 1.5B
-   checkpoint *does* ship the encoder, so it can clone arbitrary voices
-   from raw audio in one shot. (The encoding is inlined; there is no
-   separate "encode-voice" step on the 1.5B path.)
+> Use 1.5B end-to-end via `audio vibevoice ... --long-form --reference-audio
+> <wav> --reference-transcript "..."`. The 1.5B checkpoint *does* ship the
+> encoder, so it can clone arbitrary voices from raw audio in one shot.
+> (The encoding is inlined; there is no separate "encode-voice" step on the
+> 1.5B path.)
+
+To synthesize with the smaller Realtime-0.5B path against a specific
+speaker, the only supported source is one of Microsoft's [pre-built
+`.pt` voice caches](https://github.com/microsoft/VibeVoice/tree/main/demo/voices/streaming_model).
+A converter that flattens those `.pt` files into the `.safetensors` layout
+this loader expects lives in the
+[speech-models](https://github.com/soniqo/speech-models) sibling repo
+under `models/vibevoice/export/`.
 
 - **License**: MIT
 - **Output**: 24 kHz mono Float32 PCM
