@@ -182,15 +182,47 @@ public final class CosyVoiceTTSModel {
         speakerEmbedding: [Float]? = nil,
         promptToken: MLXArray? = nil,
         promptFeat: MLXArray? = nil,
+        promptText: String? = nil,
         verbose: Bool = false
     ) -> [Float] {
-        // 1. Tokenize text via Qwen2.5 BPE tokenizer
-        let textTokens = tokenizeText(text, language: language, instruction: instruction)
+        // 1. Tokenize text via Qwen2.5 BPE tokenizer. Track the content text
+        //    length separately (without the instruction frame) so the LLM's
+        //    min/max-len constraints scale to the actual content, not the
+        //    instruction. Upstream: `min_len = (text_len - prompt_text_len) * ratio`.
+        let contentTokens = tokenizer.encode(text).map { Int32($0) }
 
-        // 2. Generate speech tokens via LLM
+        // For zero-shot voice cloning: when a reference transcript is supplied,
+        // upstream's frontend constructs the LLM text input as
+        //   text = concat(prompt_text_tokens, content_text_tokens)
+        // so the LLM knows what the prompt_speech_token region linguistically
+        // represents. Without it the LLM has acoustic context but no idea what
+        // was said, and emits content-incorrect speech in the right voice.
+        // We splice the transcript through the same `tokenizeText` system-frame
+        // path: the transcript replaces the instruction string, so the final
+        // text token sequence is "You are a helpful assistant. <transcript><|endofprompt|><content>".
+        let effectiveInstruction: String
+        if let pt = promptText, !pt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            effectiveInstruction = pt
+        } else {
+            effectiveInstruction = instruction
+        }
+        let textTokens = tokenizeText(text, language: language, instruction: effectiveInstruction)
+
+        // 2. Generate speech tokens via LLM.
+        //    For zero-shot cloning, the reference's FSQ codes are passed as
+        //    `promptSpeechTokens` so the LLM's autoregressive state already
+        //    encodes the target speaker before generation begins. Without this
+        //    the LLM emits "neutral default voice" tokens that conflict with
+        //    the flow's prompt_token + prompt_feat anchors and the cloned
+        //    output drifts to a different voice (see PR #247).
+        let promptSpeechTokensArr: [Int32]? = promptToken.map { pt in
+            pt.reshaped(-1).asArray(Int32.self)
+        }
         var t0 = CFAbsoluteTimeGetCurrent()
         let speechTokens = llm.generate(
             textTokens: textTokens,
+            promptSpeechTokens: promptSpeechTokensArr,
+            contentTextLength: contentTokens.count,
             maxTokens: 500  // ~20 seconds of audio at 25 Hz
         )
         if verbose {

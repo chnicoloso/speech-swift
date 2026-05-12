@@ -5,8 +5,7 @@ import AudioCommon
 
 /// Pre-computed reference-audio conditioning for CosyVoice 3 zero-shot voice cloning.
 ///
-/// Holds everything the flow model needs to anchor synthesis to a specific
-/// speaker:
+/// Holds everything the flow + LLM need to anchor synthesis to a specific speaker:
 ///
 ///   - `speakerEmbedding`: optional 192-d CAM++ global identity vector.
 ///   - `promptToken`: `[1, T_prompt]` Int32 FSQ codes from the S3 tokenizer
@@ -15,6 +14,11 @@ import AudioCommon
 ///   - `promptFeat`: `[1, 80, T_prompt_mel]` Matcha-style log-mel of the
 ///     reference (50 Hz). Written into the DiT's `cond` slot for per-frame
 ///     timbre anchoring.
+///   - `promptText`: optional reference transcript. Upstream's zero-shot path
+///     prepends the transcript to the user's text content in the LLM input so
+///     the model knows what the prompt_speech_token region linguistically
+///     represents. Without it the LLM has acoustic context but generates
+///     content-incorrect speech (in the right voice).
 ///
 /// Build once per reference clip with `CosyVoiceTTSModel.extractVoiceProfile`
 /// and reuse across as many `synthesize(...)` calls as you need.
@@ -22,15 +26,18 @@ public struct CosyVoiceVoiceProfile: Sendable {
     public let speakerEmbedding: [Float]?
     public let promptToken: MLXArray?
     public let promptFeat: MLXArray?
+    public let promptText: String?
 
     public init(
         speakerEmbedding: [Float]? = nil,
         promptToken: MLXArray? = nil,
-        promptFeat: MLXArray? = nil
+        promptFeat: MLXArray? = nil,
+        promptText: String? = nil
     ) {
         self.speakerEmbedding = speakerEmbedding
         self.promptToken = promptToken
         self.promptFeat = promptFeat
+        self.promptText = promptText
     }
 }
 
@@ -63,7 +70,8 @@ extension CosyVoiceTTSModel {
         audio: [Float],
         sampleRate: Int,
         speechTokenizer: SpeechTokenizerModel,
-        camppSpeaker: CamPlusPlusSpeaker? = nil
+        camppSpeaker: CamPlusPlusSpeaker? = nil,
+        referenceTranscript: String? = nil
     ) throws -> CosyVoiceVoiceProfile {
         // The two mel extractors expect specific sample rates. We resample once
         // per target rate.
@@ -144,7 +152,8 @@ extension CosyVoiceTTSModel {
         return CosyVoiceVoiceProfile(
             speakerEmbedding: speakerEmbedding,
             promptToken: promptToken,
-            promptFeat: promptFeat
+            promptFeat: promptFeat,
+            promptText: referenceTranscript
         )
     }
 
@@ -163,6 +172,7 @@ extension CosyVoiceTTSModel {
             speakerEmbedding: voiceProfile.speakerEmbedding,
             promptToken: voiceProfile.promptToken,
             promptFeat: voiceProfile.promptFeat,
+            promptText: voiceProfile.promptText,
             verbose: verbose
         )
     }

@@ -360,12 +360,27 @@ public class CosyVoiceLLM: Module {
 
     /// Build the input embedding sequence for generation.
     ///
-    /// Format: [sos_embed, text_embeds..., task_id_embed]
-    /// - SOS and task_id come from the speech embedding table (special token indices)
-    /// - Text tokens come from the text embedding table
+    /// Base format: `[sos_embed, text_embeds..., task_id_embed]`.
+    /// When zero-shot voice cloning is active and `promptSpeechTokens` is set,
+    /// the reference's FSQ codes are embedded via the speech-token table and
+    /// appended after `task_id`, matching upstream's CosyVoice3LM:
     ///
-    /// Returns: [1, prefix_len, hidden_size]
-    public func buildInputSequence(textTokens: [Int32]) -> MLXArray {
+    ///   lm_input = concat([sos, text, task_id, prompt_speech_token_emb])
+    ///
+    /// The LLM then autoregresses *from the end of this prefix*, so the
+    /// generated tokens naturally continue the reference's acoustic state.
+    ///
+    /// - Parameters:
+    ///   - textTokens: text token IDs (Qwen2 vocab)
+    ///   - promptSpeechTokens: optional FSQ codes of the reference clip
+    ///     (output of `SpeechTokenizerModel.encode`), prepended into the
+    ///     speech-token autoregressive stream so generation begins from the
+    ///     reference's acoustic state.
+    /// - Returns: `[1, prefix_len, hidden_size]`
+    public func buildInputSequence(
+        textTokens: [Int32],
+        promptSpeechTokens: [Int32]? = nil
+    ) -> MLXArray {
         // Embed SOS token from speech embedding
         let sosEmbed = speechEmbedding(MLXArray([Int32(config.sosToken)]))  // [1, hidden]
 
@@ -376,11 +391,21 @@ public class CosyVoiceLLM: Module {
         // Embed task_id token from speech embedding
         let taskIdEmbed = speechEmbedding(MLXArray([Int32(config.taskIdToken)]))  // [1, hidden]
 
-        // Concatenate: [sos, text..., task_id] along sequence dimension
         let sosExpanded = sosEmbed.expandedDimensions(axis: 0)      // [1, 1, hidden]
         let taskIdExpanded = taskIdEmbed.expandedDimensions(axis: 0) // [1, 1, hidden]
 
-        return concatenated([sosExpanded, textEmbeds, taskIdExpanded], axis: 1)  // [1, prefix_len, hidden]
+        var pieces: [MLXArray] = [sosExpanded, textEmbeds, taskIdExpanded]
+
+        // Optional speech-prompt prefix: embed the reference FSQ codes via the
+        // same speech-token embedding the autoregressive generation uses, then
+        // append so the LLM's generation continues from the reference's state.
+        if let promptCodes = promptSpeechTokens, !promptCodes.isEmpty {
+            let codes = MLXArray(promptCodes).expandedDimensions(axis: 0)   // [1, T_prompt]
+            let promptEmbeds = speechEmbedding(codes)                        // [1, T_prompt, hidden]
+            pieces.append(promptEmbeds)
+        }
+
+        return concatenated(pieces, axis: 1)  // [1, prefix_len, hidden]
     }
 
     /// Single forward step through the transformer.
@@ -446,13 +471,16 @@ public class CosyVoiceLLM: Module {
     /// - Returns: Array of generated speech token IDs (FSQ codes, 0-6560)
     public func generate(
         textTokens: [Int32],
+        promptSpeechTokens: [Int32]? = nil,
+        contentTextLength: Int? = nil,
         sampling: CosyVoiceSamplingConfig = CosyVoiceSamplingConfig(),
         maxTokens: Int = 4096
     ) -> [Int32] {
         let eosToken = config.eosToken
 
         // Build prefix embeddings: [1, prefix_len, hidden]
-        let prefixEmbeds = buildInputSequence(textTokens: textTokens)
+        let prefixEmbeds = buildInputSequence(
+            textTokens: textTokens, promptSpeechTokens: promptSpeechTokens)
         let prefixLen = prefixEmbeds.dim(1)
 
         // Prefill: forward entire prefix through transformer
@@ -465,8 +493,13 @@ public class CosyVoiceLLM: Module {
         let suppressStart = config.speechTokenSize  // 6561
         let suppressEnd = config.totalSpeechVocabSize  // 6761
 
-        // Min length: at least minTokenTextRatio * text_len tokens before EOS
-        let textLen = textTokens.count
+        // Min length: at least minTokenTextRatio * text_len tokens before EOS.
+        // Upstream uses (text_len - prompt_text_len), i.e. the pure content
+        // token count — NOT the full text including instruction. Without this,
+        // the LLM is forced to generate way more tokens than the content
+        // requires when a long instruction prefix is present, leading to
+        // 4-second outputs for 1-word phrases.
+        let textLen = contentTextLength ?? textTokens.count
         let minLen = Int(Float(textLen) * sampling.minTokenTextRatio)
 
         var currentToken = sampleToken(

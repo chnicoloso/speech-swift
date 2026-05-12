@@ -92,6 +92,9 @@ public struct SpeakCommand: ParsableCommand {
     @Option(name: .long, help: "[cosyvoice] Path to speech_tokenizer.safetensors (S3-Tokenizer-v3). When supplied, --voice-sample is upgraded from spk-only cloning (cos~0.83 cap) to upstream zero-shot conditioning with prompt_token + prompt_feat (preserves identity through emotion changes). Auto-detected in the bundle's cache dir if omitted.")
     public var cosySpeechTokenizer: String?
 
+    @Option(name: .long, help: "[cosyvoice] Reference transcript: the text content of --voice-sample. Required for proper zero-shot voice cloning — without it the LLM has acoustic context but no idea what was said in the reference, and emits content-incorrect speech in the right voice.")
+    public var cosyReferenceTranscript: String?
+
     @Flag(name: .long, help: "Show detailed timing info")
     public var verbose: Bool = false
 
@@ -457,7 +460,8 @@ public struct SpeakCommand: ParsableCommand {
                     defaultVoiceProfile = try cosyModel.extractVoiceProfile(
                         audio: refSamples16k,
                         sampleRate: 16000,
-                        speechTokenizer: tokenizer
+                        speechTokenizer: tokenizer,
+                        referenceTranscript: cosyReferenceTranscript
                     )
                     if let p = defaultVoiceProfile {
                         let tokLen = p.promptToken?.dim(1) ?? 0
