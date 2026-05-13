@@ -1,6 +1,49 @@
 import XCTest
 import Foundation
+import Hub
+import MLX
+import MLXNN
+import Tokenizers
 @testable import VoxCPM2TTS
+
+final class StubVoxCPM2Tokenizer: Tokenizer {
+    let idToToken: [Int: String]
+    let tokenToId: [String: Int]
+    let tokenizations: [String: [String]]
+
+    init(_ mapping: [Int: String], tokenizations: [String: [String]] = [:]) {
+        self.idToToken = mapping
+        self.tokenToId = Dictionary(uniqueKeysWithValues: mapping.map { ($0.value, $0.key) })
+        self.tokenizations = tokenizations
+    }
+
+    func tokenize(text: String) -> [String] { tokenizations[text] ?? text.map(String.init) }
+    func encode(text: String) -> [Int] { encode(text: text, addSpecialTokens: true) }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        let ids = text.map { String($0) }.compactMap { tokenToId[$0] }
+        guard addSpecialTokens else { return ids }
+        return [bosTokenId ?? 1] + ids
+    }
+    func decode(tokens: [Int], skipSpecialTokens: Bool) -> String {
+        tokens.compactMap { idToToken[$0] }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { tokenToId[token] }
+    func convertIdToToken(_ id: Int) -> String? { idToToken[id] }
+    var bosToken: String? { "<s>" }
+    var bosTokenId: Int? { 1 }
+    var eosToken: String? { "</s>" }
+    var eosTokenId: Int? { 2 }
+    var unknownToken: String? { "<unk>" }
+    var unknownTokenId: Int? { 0 }
+    var fuseUnknownTokens: Bool { false }
+    func applyChatTemplate(messages: [Message]) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?, additionalContext: [String : any Sendable]?) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool, maxLength: Int?, tools: [ToolSpec]?) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool, maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String : any Sendable]?) throws -> [Int] { [] }
+}
 
 final class VoxCPM2TTSConfigTests: XCTestCase {
     func testModelArgsRoundTripAndLoad() throws {
@@ -142,6 +185,158 @@ final class VoxCPM2TTSConfigTests: XCTestCase {
         XCTAssertEqual(config.outSampleRate, 48_000)
         XCTAssertEqual(config.srBinBoundaries, [20_000, 30_000, 40_000])
     }
+
+    func testAudioVAECastPromotesParametersToFloat32() {
+        let vae = AudioVAE(AudioVAEConfig())
+
+        let bf16Weight = MLXArray.ones(vae.decoder.conv_out.weight.shape, dtype: .bfloat16)
+        vae.decoder.conv_out.weight = bf16Weight
+        XCTAssertEqual(vae.decoder.conv_out.weight.dtype, .bfloat16)
+
+        vae.castParametersToFloat32()
+
+        XCTAssertEqual(vae.decoder.conv_out.weight.dtype, .float32)
+    }
+
+    func testTokenizerConfigOverlayRewritesTokenizerClassToLlamaTokenizer() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        let tokenizerDataURL = directory.appendingPathComponent("tokenizer.json")
+
+        let config = """
+        {
+          "tokenizer_class": "VoxCPM2Tokenizer",
+          "auto_map": {
+            "AutoTokenizer": ["tokenization_voxcpm2.VoxCPM2Tokenizer", null]
+          }
+        }
+        """
+        try config.data(using: .utf8)!.write(to: configURL, options: .atomic)
+        try "{}".data(using: .utf8)!.write(to: tokenizerDataURL, options: .atomic)
+
+        try VoxCPM2TTSModel.applyTokenizerConfigOverlay(in: directory)
+
+        let patchedData = try Data(contentsOf: configURL)
+        let patched = try JSONSerialization.jsonObject(with: patchedData) as? [String: Any]
+        XCTAssertEqual(patched?["tokenizer_class"] as? String, "LlamaTokenizer")
+        XCTAssertNil(patched?["auto_map"])
+        XCTAssertFalse(try VoxCPM2TTSModel.tokenizerSnapshotNeedsRefresh(in: directory))
+    }
+
+    func testVoxCPM2TokenizerCompatibilityPathPromotesTokenizerClassToLlamaTokenizer() {
+        let tokenizerConfig = Config([
+            "tokenizer_class": "VoxCPM2Tokenizer",
+            "legacy": true,
+            "add_bos_token": true,
+            "add_eos_token": false
+        ])
+
+        let compatible = VoxCPM2TTSModel.compatibleTokenizerConfig(for: tokenizerConfig)
+        let compatibleDict = compatible.dictionary(or: [:])
+
+        XCTAssertEqual(compatibleDict[Config.Key("tokenizer_class")]?.string(), "LlamaTokenizer")
+        XCTAssertEqual(compatibleDict[Config.Key("legacy")]?.boolean(), true)
+        XCTAssertEqual(compatibleDict[Config.Key("add_bos_token")]?.boolean(), true)
+        XCTAssertEqual(compatibleDict[Config.Key("add_eos_token")]?.boolean(), false)
+    }
+
+    func testVoxCPM2ChineseTokenSplitMapExpandsMultiCharTokens() {
+        let tokenizer = StubVoxCPM2Tokenizer([
+            0: "<unk>",
+            1: "你",
+            2: "好",
+            3: "你好",
+            4: "▁你好",
+            5: "Hello",
+            6: "▁Hello"
+        ])
+
+        let splitMap = VoxCPM2TTSModel.buildVoxCPM2TokenizerSplitMap(tokenizer: tokenizer, vocabSize: 7)
+        XCTAssertEqual(splitMap[3], [1, 2])
+        XCTAssertEqual(splitMap[4], [1, 2])
+        XCTAssertNil(splitMap[5])
+
+        let expanded = VoxCPM2TTSModel.expandVoxCPM2TokenizerIds([4, 5, 3], using: splitMap)
+        XCTAssertEqual(expanded, [1, 2, 5, 1, 2])
+    }
+
+    func testTokenizeMatchesWrappedTokenizerLikeUpstream() throws {
+        let tokenizer = StubVoxCPM2Tokenizer([
+            0: "<unk>",
+            1: "<s>",
+            2: "H",
+            3: "i"
+        ])
+
+        let model = VoxCPM2TTSModel(args: ModelArgs())
+        model.setTokenizer(tokenizer)
+
+        let ids = try model.tokenize("Hi")
+        XCTAssertEqual(ids, [2, 3])
+    }
+
+    func testTokenizePreservesCJKSplitMapWithLlamaStyleTokens() throws {
+        let tokenizer = StubVoxCPM2Tokenizer(
+            [
+                0: "<unk>",
+                1: "你",
+                2: "好",
+                3: "▁你好",
+                4: "▁Hello",
+            ],
+            tokenizations: [
+                "你好 Hello": ["▁你好", "▁Hello"]
+            ]
+        )
+
+        let model = VoxCPM2TTSModel(args: ModelArgs())
+        model.setTokenizer(tokenizer)
+
+        let ids = try model.tokenize("你好 Hello")
+        XCTAssertEqual(ids, [1, 2, 4])
+    }
+
+    func testUnifiedCFMTimeSpanMatchesUpstreamSwaySchedule() {
+        let schedule = makeUnifiedCFMTimeSpan(timesteps: 10, scheduler: "log-norm", sigmaMin: 1e-6)
+        let expected: [Float] = (0...10).map { step in
+            let progress = Double(step) / 10.0
+            let t = 1.0 - progress
+            return Float(t + (cos(Double.pi / 2.0 * t) - 1.0 + t))
+        }
+
+        XCTAssertEqual(schedule.count, expected.count)
+        for (actual, expectedValue) in zip(schedule, expected) {
+            XCTAssertEqual(actual, expectedValue, accuracy: Float(1e-6))
+        }
+    }
+
+    func testMiniCPMLongRoPEUsesLongFactorForOfficialVoxCPM2Config() {
+        var config = LMConfig()
+        config.hiddenSize = 4
+        config.intermediateSize = 8
+        config.numAttentionHeads = 2
+        config.numKeyValueHeads = 1
+        config.kvChannels = 2
+        config.maxPositionEmbeddings = 32_768
+        config.originalMaxPositionEmbeddings = 8_192
+        config.ropeTheta = 10_000
+        config.ropeScaling = RopeScalingConfig()
+        config.ropeScaling?.originalMaxPositionEmbeddings = 8_192
+        config.ropeScaling?.shortFactor = [1.0]
+        config.ropeScaling?.longFactor = [2.0]
+
+        let rope = MiniCPMLongRoPE(config: config)
+        let positionIds = MLXArray([Int32(0), Int32(1), Int32(2)])
+        let (cosEmb, _) = rope(positionIds)
+
+        let scale = Float(sqrt(1.0 + log(32_768.0 / 8_192.0) / log(8_192.0)))
+        let expectedLong = Float(Foundation.cos(0.5)) * scale
+        XCTAssertEqual(cosEmb[1, 0].item(Float.self), expectedLong, accuracy: 1e-5)
+    }
 }
 
 final class VoxCPM2TTSLayerTests: XCTestCase {
@@ -168,6 +363,36 @@ final class VoxCPM2TTSLayerTests: XCTestCase {
         XCTAssertEqual(layer.in_proj.shape.1, 2)
         XCTAssertEqual(layer.out_proj.shape.0, 3)
         XCTAssertEqual(layer.out_proj.shape.1, 4)
+    }
+}
+
+final class VoxCPM2TTSQuantizationTests: XCTestCase {
+    private final class PromotionProbe: Module {
+        @ModuleInfo var dense: Linear
+        @ModuleInfo var quantized: QuantizedLinear
+
+        override init() {
+            let denseWeight = MLXArray(Array(repeating: Float(1.0), count: 32 * 32), [32, 32]).asType(.bfloat16)
+            let dense = Linear(weight: denseWeight, bias: nil)
+            self._dense = ModuleInfo(wrappedValue: dense)
+            self._quantized = ModuleInfo(wrappedValue: QuantizedLinear(dense, groupSize: 32, bits: 4))
+            super.init()
+        }
+    }
+
+    func testFloat32PromotionSkipsQuantizedModules() {
+        let probe = PromotionProbe()
+        XCTAssertEqual(probe.dense.weight.dtype, .bfloat16)
+        XCTAssertEqual(probe.quantized.weight.dtype, .uint32)
+
+        _ = probe.apply(filter: { module, _, _ in
+            !(module is Quantized)
+        }) { array in
+            array.asType(.float32)
+        }
+
+        XCTAssertEqual(probe.dense.weight.dtype, .float32)
+        XCTAssertEqual(probe.quantized.weight.dtype, .uint32)
     }
 }
 

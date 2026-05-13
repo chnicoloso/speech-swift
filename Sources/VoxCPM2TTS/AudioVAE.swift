@@ -67,6 +67,7 @@ public final class CausalConv1d: Module {
     public let dilation: Int
     public let groups: Int
     private let padVal: Int
+    private let outputPadding: Int
 
     public init(
         inputChannels: Int,
@@ -75,10 +76,12 @@ public final class CausalConv1d: Module {
         stride: Int = 1,
         dilation: Int = 1,
         padding: Int = 0,
+        outputPadding: Int = 0,
         groups: Int = 1,
         bias: Bool = true
     ) {
         self.padVal = padding
+        self.outputPadding = outputPadding
         self.stride = stride
         self.dilation = dilation
         self.groups = groups
@@ -96,7 +99,8 @@ public final class CausalConv1d: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = x
         if padVal > 0 {
-            let zeros = MLXArray.zeros([x.dim(0), padVal * 2, x.dim(2)], dtype: x.dtype)
+            let pad = max(0, padVal * 2 - outputPadding)
+            let zeros = MLXArray.zeros([x.dim(0), pad, x.dim(2)], dtype: x.dtype)
             h = concatenated([zeros, h], axis: 1)
         }
         var y = conv1d(h, weight, stride: stride, padding: 0, dilation: dilation, groups: groups)
@@ -287,7 +291,8 @@ public final class CausalEncoderBlock: Module {
             outputChannels: outputDim,
             kernelSize: 2 * stride,
             stride: stride,
-            padding: Int(ceil(Double(stride) / 2.0))
+            padding: Int(ceil(Double(stride) / 2.0)),
+            outputPadding: stride % 2
         ))
         super.init()
     }
@@ -377,18 +382,19 @@ public final class SampleRateConditionLayer: Module {
         super.init()
     }
 
-    public func getSrIdx(_ sr: MLXArray) -> MLXArray {
+    public func getSrIdx(_ sr: MLXArray) -> Int {
         guard let srBoundaries else {
-            return MLXArray([Int32(0)])
+            return 0
         }
-        let boundaries = MLXArray(srBoundaries.map(Int32.init))
-        let idx = sum(sr .>= boundaries).asType(.int32)
-        return idx.reshaped([1])
+        let value = Int(sr.item(Int32.self))
+        return srBoundaries.reduce(0) { partial, boundary in
+            partial + (value >= boundary ? 1 : 0)
+        }
     }
 
     public func callAsFunction(_ x: MLXArray, srCond: MLXArray) -> MLXArray {
         var h = x
-        let srIdx = getSrIdx(srCond)
+        let srIdx = MLXArray([Int32(getSrIdx(srCond))])
         let scale = scale_embed(srIdx).expandedDimensions(axis: 1)
         let bias = bias_embed(srIdx).expandedDimensions(axis: 1)
         h = h * scale + bias
@@ -457,6 +463,7 @@ public final class CausalEncoder: Module {
 public final class CausalDecoder: Module {
     @ModuleInfo var conv_in: ConvStack1d
     @ModuleInfo var blocks: CausalDecoderBlockStack
+    @ModuleInfo var srCondLayers: SampleRateConditionLayerStack
     @ModuleInfo var snake_out: Snake1d
     @ModuleInfo var conv_out: CausalConv1d
     public let srBoundaries: [Int]?
@@ -471,7 +478,8 @@ public final class CausalDecoder: Module {
         srBinBoundaries: [Int]? = nil,
         condType: String = "scale_bias",
         condDim: Int = 128,
-        condOutLayer: Bool = false
+        condOutLayer: Bool = false,
+        srCondLayers: [SampleRateConditionLayer] = []
     ) {
         self.srBoundaries = srBinBoundaries
         let convInLayers: [CausalConv1d] = [
@@ -504,6 +512,7 @@ public final class CausalDecoder: Module {
             ))
         }
         self._blocks = ModuleInfo(wrappedValue: CausalDecoderBlockStack(layers: blocks))
+        self._srCondLayers = ModuleInfo(wrappedValue: SampleRateConditionLayerStack(layers: srCondLayers))
         self._snake_out = ModuleInfo(wrappedValue: Snake1d(channels: channels / (1 << rates.count)))
         self._conv_out = ModuleInfo(wrappedValue: CausalConv1d(
             inputChannels: channels / (1 << rates.count),
@@ -528,11 +537,22 @@ public final class CausalDecoder: Module {
         var h = x
         h = conv_in(h)
 
-        if let srCond {
-            _ = getSrIdx(srCond)
-        }
-        for block in blocks.layers {
-            h = block(h)
+        let effectiveSrCond = srCond ?? MLXArray([Int32(48_000)])
+        if !srCondLayers.layers.isEmpty {
+            let count = min(blocks.layers.count, srCondLayers.layers.count)
+            for index in 0..<count {
+                h = srCondLayers.layers[index](h, srCond: effectiveSrCond)
+                h = blocks.layers[index](h)
+            }
+            if count < blocks.layers.count {
+                for index in count..<blocks.layers.count {
+                    h = blocks.layers[index](h)
+                }
+            }
+        } else {
+            for block in blocks.layers {
+                h = block(h)
+            }
         }
 
         h = snake_out(h)
@@ -579,7 +599,18 @@ public final class AudioVAE: Module {
             srBinBoundaries: config.srBinBoundaries,
             condType: config.condType,
             condDim: config.condDim,
-            condOutLayer: config.condOutLayer
+            condOutLayer: config.condOutLayer,
+            srCondLayers: config.decoderRates.enumerated().map { index, _ in
+                let inputDim = config.decoderDim / (1 << index)
+                return SampleRateConditionLayer(
+                    inputDim: inputDim,
+                    srBinBuckets: max(1, config.srBinBoundaries.count + 1),
+                    condType: config.condType,
+                    condDim: config.condDim,
+                    outLayer: config.condOutLayer && index == config.decoderRates.count - 1,
+                    srBoundaries: config.srBinBoundaries
+                )
+            }
         ))
         super.init()
     }
@@ -652,5 +683,14 @@ public final class AudioVAE: Module {
             }
         }
         return remapped
+    }
+
+    /// Promote all AudioVAE parameters to float32 after loading.
+    /// This mirrors the repo's existing traversal pattern used by `clearParameters()`
+    /// but preserves the loaded values.
+    public func castParametersToFloat32() {
+        apply(filter: Self.filterAll) { array in
+            array.asType(.float32)
+        }
     }
 }

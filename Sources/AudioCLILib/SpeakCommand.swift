@@ -412,76 +412,89 @@ public struct SpeakCommand: ParsableCommand {
 
     private func runVoxCPM2() throws {
         try runAsync {
-            guard let inputText = text else {
-                print("Error: text argument is required for VoxCPM2")
-                throw ExitCode(1)
+            let runOnCPU = ProcessInfo.processInfo.environment["VOXCPM2_FORCE_CPU"] == "1"
+            let body: () async throws -> Void = {
+                guard let inputText = text else {
+                    print("Error: text argument is required for VoxCPM2")
+                    throw ExitCode(1)
+                }
+
+                let resolvedId = try resolvedVoxCPM2ModelId()
+                print("Loading VoxCPM2 model (\(resolvedId))...")
+                let model = try await VoxCPM2TTSModel.fromPretrained(
+                    modelId: resolvedId,
+                    progressHandler: reportProgress
+                )
+
+                if let s = seed {
+                    MLX.seed(s)
+                    print("  Seed: \(s) (deterministic flow + LM + vocoder sampling)")
+                }
+
+                let referenceAudio: [Float]?
+                if let refPath = voxcpm2RefAudio {
+                    let refURL = URL(fileURLWithPath: refPath)
+                    referenceAudio = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
+                    print("  Reference audio: \(referenceAudio?.count ?? 0) samples")
+                } else if let fallbackVoiceSample = voiceSample {
+                    let refURL = URL(fileURLWithPath: fallbackVoiceSample)
+                    referenceAudio = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
+                    print("  Reference audio: \(referenceAudio?.count ?? 0) samples")
+                } else {
+                    referenceAudio = nil
+                }
+
+                let promptAudio: [Float]?
+                if let promptPath = voxcpm2PromptAudio {
+                    let promptURL = URL(fileURLWithPath: promptPath)
+                    promptAudio = try AudioFileLoader.load(url: promptURL, targetSampleRate: 16000)
+                    print("  Prompt audio: \(promptAudio?.count ?? 0) samples")
+                } else {
+                    promptAudio = nil
+                }
+
+                print("Synthesizing with VoxCPM2 (language: \(effectiveLanguage))...")
+                let audio = try await model.generateVoxCPM2(
+                    text: inputText,
+                    language: effectiveLanguage,
+                    maxTokens: voxcpm2MaxTokens,
+                    minTokens: voxcpm2MinTokens,
+                    refAudio: referenceAudio,
+                    promptText: voxcpm2PromptText,
+                    promptAudio: promptAudio,
+                    inferenceTimesteps: voxcpm2Timesteps,
+                    cfgValue: voxcpm2CfgValue,
+                    streamingPrefixLen: voxcpm2StreamingPrefixLen,
+                    warmupPatches: voxcpm2WarmupPatches,
+                    instruct: voxcpm2Instruct
+                )
+
+                guard !audio.isEmpty else {
+                    print("Error: No audio generated")
+                    throw ExitCode(1)
+                }
+
+                let sampleRate = model.sampleRate
+                let outputURL = URL(fileURLWithPath: output)
+                if !play {
+                    try WAVWriter.write(samples: audio, sampleRate: sampleRate, to: outputURL)
+                    print("Saved \(audio.count) samples (\(formatDuration(audio.count, sampleRate: sampleRate))s) to \(output)")
+                } else {
+                    playAudio(samples: audio, sampleRate: sampleRate)
+                }
+
+                model.unload()
             }
 
-            let resolvedId = try resolvedVoxCPM2ModelId()
-            print("Loading VoxCPM2 model (\(resolvedId))...")
-            let model = try await VoxCPM2TTSModel.fromPretrained(
-                modelId: resolvedId,
-                progressHandler: reportProgress
-            )
-
-            if let s = seed {
-                MLX.seed(s)
-                print("  Seed: \(s) (deterministic flow + LM + vocoder sampling)")
-            }
-
-            let referenceAudio: [Float]?
-            if let refPath = voxcpm2RefAudio {
-                let refURL = URL(fileURLWithPath: refPath)
-                referenceAudio = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
-                print("  Reference audio: \(referenceAudio?.count ?? 0) samples")
-            } else if let fallbackVoiceSample = voiceSample {
-                let refURL = URL(fileURLWithPath: fallbackVoiceSample)
-                referenceAudio = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
-                print("  Reference audio: \(referenceAudio?.count ?? 0) samples")
+            if runOnCPU {
+                try await Device.withDefaultDevice(.cpu) {
+                    try await Stream.withNewDefaultStream(device: .cpu) {
+                        try await body()
+                    }
+                }
             } else {
-                referenceAudio = nil
+                try await body()
             }
-
-            let promptAudio: [Float]?
-            if let promptPath = voxcpm2PromptAudio {
-                let promptURL = URL(fileURLWithPath: promptPath)
-                promptAudio = try AudioFileLoader.load(url: promptURL, targetSampleRate: 16000)
-                print("  Prompt audio: \(promptAudio?.count ?? 0) samples")
-            } else {
-                promptAudio = nil
-            }
-
-            print("Synthesizing with VoxCPM2 (language: \(effectiveLanguage))...")
-            let audio = try await model.generateVoxCPM2(
-                text: inputText,
-                language: effectiveLanguage,
-                maxTokens: voxcpm2MaxTokens,
-                minTokens: voxcpm2MinTokens,
-                refAudio: referenceAudio,
-                promptText: voxcpm2PromptText,
-                promptAudio: promptAudio,
-                inferenceTimesteps: voxcpm2Timesteps,
-                cfgValue: voxcpm2CfgValue,
-                streamingPrefixLen: voxcpm2StreamingPrefixLen,
-                warmupPatches: voxcpm2WarmupPatches,
-                instruct: voxcpm2Instruct
-            )
-
-            guard !audio.isEmpty else {
-                print("Error: No audio generated")
-                throw ExitCode(1)
-            }
-
-            let sampleRate = model.sampleRate
-            let outputURL = URL(fileURLWithPath: output)
-            if !play {
-                try WAVWriter.write(samples: audio, sampleRate: sampleRate, to: outputURL)
-                print("Saved \(audio.count) samples (\(formatDuration(audio.count, sampleRate: sampleRate))s) to \(output)")
-            } else {
-                playAudio(samples: audio, sampleRate: sampleRate)
-            }
-
-            model.unload()
         }
     }
 

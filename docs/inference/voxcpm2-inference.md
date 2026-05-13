@@ -67,6 +67,8 @@ speech speak "This is an ultimate cloning demo." \
 - Reference audio is loaded at 16 kHz and resampled internally when needed
 - Output samples are written at 48 kHz
 - If `--voxcpm2-prompt-audio` is set, `--voxcpm2-prompt-text` must be provided too
+- The HF snapshot includes `tokenization_voxcpm2.py` and `tokenizer_config.json` with `VoxCPM2Tokenizer`; the Swift backend refreshes stale tokenizer snapshots and mirrors the upstream multi-character Chinese token split before encoding
+- On Apple Silicon, the Swift backend promotes VoxCPM2 parameters to `float32` by default to match the upstream MPS safety policy, and the `AudioVAE` decode path always receives `float32` latents
 
 ## Swift API
 

@@ -82,6 +82,7 @@ The current Swift implementation follows the upstream VoxCPM2 control tokens:
 - `generateVoxCPM2(...)` accepts optional `refAudio`, `promptAudio`, `promptText`, and `instruct`
 - `language` is accepted for protocol compatibility, but the upstream model auto-detects supported languages
 - `AudioVAE` and the LocDiT stack are loaded from the same model directory as the base LM weights
+- On Apple Silicon, the Swift runtime promotes the low-precision VoxCPM2 parameters to `float32` by default to mirror the upstream MPS safety policy; `AudioVAE` decode always runs in `float32`
 
 ## Weight Bundles
 
