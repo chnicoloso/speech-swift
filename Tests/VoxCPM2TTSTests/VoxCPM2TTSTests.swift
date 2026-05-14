@@ -186,11 +186,20 @@ final class VoxCPM2TTSConfigTests: XCTestCase {
         XCTAssertEqual(config.srBinBoundaries, [20_000, 30_000, 40_000])
     }
 
-    func testAudioVAECastPromotesParametersToFloat32() {
+    func testAudioVAECastPromotesParametersToFloat32() throws {
         let vae = AudioVAE(AudioVAEConfig())
 
+        // Seed the weight via the supported `update(parameters:)` path so MLX
+        // rebuilds its items cache against the new array reference. Direct
+        // property assignment bypasses the cache, and the subsequent
+        // `apply(filter:map:)` traversal in castParametersToFloat32() can run
+        // against a stale reference depending on Module.items() lazy-build
+        // timing.
         let bf16Weight = MLXArray.ones(vae.decoder.conv_out.weight.shape, dtype: .bfloat16)
-        vae.decoder.conv_out.weight = bf16Weight
+        try vae.decoder.conv_out.update(
+            parameters: ModuleParameters.unflattened(["weight": bf16Weight]),
+            verify: .shapeMismatch
+        )
         XCTAssertEqual(vae.decoder.conv_out.weight.dtype, .bfloat16)
 
         vae.castParametersToFloat32()
