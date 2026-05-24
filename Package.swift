@@ -73,6 +73,10 @@ let package = Package(
             targets: ["MagpieTTS"]
         ),
         .library(
+            name: "MagpieTTSCoreML",
+            targets: ["MagpieTTSCoreML"]
+        ),
+        .library(
             name: "OmnilingualASR",
             targets: ["OmnilingualASR"]
         ),
@@ -302,6 +306,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MagpieTTSCoreML",
+            dependencies: [
+                "AudioCommon",
+                "MagpieTTS",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
+        ),
+        .target(
             name: "OmnilingualASR",
             dependencies: [
                 "AudioCommon",
@@ -382,6 +395,7 @@ let package = Package(
                 "MAGNeTMusicGen",
                 "FlashSR",
                 "MagpieTTS",
+                "MagpieTTSCoreML",
                 "MADLADTranslation",
                 "SpeechWakeWord",
                 "AudioCommon",
@@ -554,6 +568,15 @@ let package = Package(
                 "Qwen3ASR",
                 "AudioCommon",
                 .product(name: "MLX", package: "mlx-swift")
+            ]
+        ),
+        .testTarget(
+            name: "MagpieTTSCoreMLTests",
+            dependencies: [
+                "MagpieTTSCoreML",
+                "MagpieTTS",
+                "Qwen3ASR",
+                "AudioCommon",
             ]
         ),
         .testTarget(

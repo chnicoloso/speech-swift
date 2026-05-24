@@ -128,6 +128,58 @@ the bundle. The CLI rejects the shared `--voice-sample` / `--speaker` /
 `--magpie-speaker` flag or the engines that do support cloning
 (`qwen3`, `cosyvoice`, `voxcpm2`).
 
+## CoreML backend (`--engine magpie-coreml`)
+
+`Sources/MagpieTTSCoreML/` ships a CoreML-driven pipeline backed by
+[`aufklarer/Magpie-TTS-Multilingual-357M-CoreML-8bit`](https://huggingface.co/aufklarer/Magpie-TTS-Multilingual-357M-CoreML-8bit)
+(~342 MB on disk, INT8 weights). The four `.mlmodelc` packages
+(`text_encoder`, `decoder_prefill`, `decoder_step`,
+`nanocodec_decoder`) handle the heavy lifting on ANE / GPU; a
+Swift-side FSQ inverse turns the sampled codes into the 32-dim
+latents the codec window consumes.
+
+```bash
+speech speak "Hello world." --engine magpie-coreml --magpie-speaker aria -o hi.wav
+speech speak "Hola mundo." --engine magpie-coreml --language es --magpie-speaker leo -o hola.wav
+```
+
+Caveats vs `--engine magpie`:
+
+- **Pure-Swift LocalTransformer.** The 1-layer LT and 8 audio embedding
+  tables are extracted from the MLX bundle once at `fromPretrained` and
+  cached to disk (`extracted_weights.bin`, ~70 MB). The first invocation
+  pays the MLX module load + extraction (~3–4 s); every subsequent
+  process load reads the cache directly in ~15 ms. The AR loop itself
+  runs pure CoreML + Accelerate — no MLX dispatch per frame. ASR
+  round-trip matches the MLX backend bit-for-bit.
+- **Streaming is supported.** The bundle ships two nanocodec variants:
+  `nanocodec_decoder.mlmodelc` (64-frame batch, used by
+  `synthesize()`) and `nanocodec_decoder_streaming.mlmodelc` (8-frame
+  window, used by `synthesizeStream()`). Per-chunk steady-state is
+  ~65 ms; first-packet latency is ~6 s cold (ANE compile dominates),
+  drops to ~150–250 ms after `model.prewarm()`. Call `prewarm()`
+  once at app start for low-latency streaming.
+- **No Japanese.** The CoreML bundle doesn't ship a JA tokenizer JSON
+  (the model supports it; we just haven't exported the assets).
+  `--language ja` with `--engine magpie-coreml` auto-routes to the
+  MLX backend and logs a stderr note about the fallback.
+
+### Performance (M4 Pro, release build)
+
+| Mode | RTF | First-packet | Note |
+|---|---|---|---|
+| Batch (warm) | 0.87 IT / 0.99 EN | n/a | `synthesize()` |
+| Streaming (warm, after `prewarm()`) | ~1.26 | ~150–250 ms | `synthesizeStream()`, 8-frame chunks (~370 ms each) |
+| Streaming (cold, no prewarm) | ~1.26 | ~6 s | ANE compile pays once; not session-amortised |
+
+MLX backend remains the fastest path on macOS (RTF 0.23–0.26); the
+CoreML pipeline's main value is ANE residency for iOS deployment.
+
+Speaker ordering matches the bundle's `speaker_info.json`
+(`0=John, 1=Sofia, 2=Aria, 3=Jason, 4=Leo`), which is a different
+ordering than the MLX bundle. The CLI accepts the same five names —
+the speaker enum maps internally.
+
 ## Known limitations / follow-ups
 
 - **JA pitch accent** — without `pyopenjtalk` we use the heiban (acc=0)
@@ -142,3 +194,9 @@ the bundle. The CLI rejects the shared `--voice-sample` / `--speaker` /
   codec state cache can drop streaming RTF below 0.3.
 - **FP16 bundle** is not on HuggingFace yet (export available locally in
   `speech-models/models/magpie-tts/export/output/Magpie-TTS-Multilingual-357M-MLX-FP16`).
+- **CoreML LT + audio embeddings** — the CoreML bundle currently
+  delegates the LocalTransformer + audio embedding averaging back to
+  MLX. Shipping `local_transformer/*.npy` and `audio_embedding_*.npy`
+  inside the CoreML bundle (and a Swift LT) would let `--engine
+  magpie-coreml` run without the MLX runtime at all — the prerequisite
+  for ANE-only iOS deployment.
