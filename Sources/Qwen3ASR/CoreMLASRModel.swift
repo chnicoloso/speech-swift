@@ -93,14 +93,16 @@ public class CoreMLASRModel {
         language: String? = nil,
         maxTokens: Int = 448
     ) throws -> String {
-        // Extract mel features
-        let melFeatures = featureExtractor.process(audio, sampleRate: sampleRate)
+        let profile = ProcessInfo.processInfo.environment["COREML_ASR_PROFILE"] == "1"
+        let t0 = CFAbsoluteTimeGetCurrent()
 
-        // Encode audio → embeddings [1, T/8, 1024]
+        let melFeatures = featureExtractor.process(audio, sampleRate: sampleRate)
+        let t1 = CFAbsoluteTimeGetCurrent()
+
         let audioEmbeds = try encoder.encode(melFeatures)
         let numAudioTokens = audioEmbeds.dim(1)
+        let t2 = CFAbsoluteTimeGetCurrent()
 
-        // Reset decoder KV cache
         decoder.resetCache()
 
         // Build chat template token sequence
@@ -130,25 +132,36 @@ public class CoreMLASRModel {
         }
         suffixTokens.append(asrTextId)
 
-        // ── Prefill: process all prefix tokens ──
+        // ── Prefill: process all prefix tokens (one batched call) ──
         var lastLogits: MLMultiArray?
-
-        for token in prefixTokens {
-            let embedding = try decoder.embed(tokenId: token)
-            lastLogits = try decoder.decoderStep(embedding: embedding)
-        }
+        lastLogits = try decoder.decoderPrefillTokens(prefixTokens)
+        let t3 = CFAbsoluteTimeGetCurrent()
 
         // ── Prefill: process audio embeddings ──
-        for i in 0..<numAudioTokens {
-            let audioEmbed = try decoder.audioEmbeddingToMultiArray(audioEmbeds, at: i)
-            lastLogits = try decoder.decoderStep(embedding: audioEmbed)
+        // Bulk-extract the MLX audio embeddings once (single Metal sync)
+        // then feed them to the decoder in batched chunks of
+        // ``prefillBatchSize`` tokens. The fixed-T CoreML decoder packs
+        // T tokens per ANE dispatch, so a 20 s / 250-token clip becomes
+        // ~2 calls instead of 250 (each ANE dispatch costs ~30 ms — the
+        // dispatch overhead dominated the per-step cost in profiling).
+        let _ = audioEmbeds.dim(2)  // sanity-check hidden dim
+        let audioEmbedsFlat: [Float] = audioEmbeds.asArray(Float.self)
+        let chunk = decoder.prefillBatchSize
+        var consumed = 0
+        while consumed < numAudioTokens {
+            let n = min(chunk, numAudioTokens - consumed)
+            lastLogits = try decoder.decoderPrefill(
+                flatEmbeddings: audioEmbedsFlat,
+                offset: consumed,
+                realCount: n,
+            )
+            consumed += n
         }
+        let t4 = CFAbsoluteTimeGetCurrent()
 
-        // ── Prefill: process suffix tokens ──
-        for token in suffixTokens {
-            let embedding = try decoder.embed(tokenId: token)
-            lastLogits = try decoder.decoderStep(embedding: embedding)
-        }
+        // ── Prefill: process suffix tokens (one batched call) ──
+        lastLogits = try decoder.decoderPrefillTokens(suffixTokens)
+        let t5 = CFAbsoluteTimeGetCurrent()
 
         // ── Autoregressive generation ──
         guard var logits = lastLogits else {
@@ -166,6 +179,17 @@ public class CoreMLASRModel {
             logits = try decoder.decoderStep(embedding: embedding)
             nextToken = decoder.argmax(logits: logits)
             generatedTokens.append(nextToken)
+        }
+        let t6 = CFAbsoluteTimeGetCurrent()
+
+        if profile {
+            let ms = { (a: CFAbsoluteTime, b: CFAbsoluteTime) in (b - a) * 1000 }
+            print(String(format: "[COREML-ASR-PROFILE] mel=%.0fms encoder=%.0fms prefix=%.0fms audio_prefill=%.0fms(%dtok→%.1fms/tok) suffix=%.0fms gen=%.0fms(%dtok→%.1fms/tok) total=%.0fms",
+                         ms(t0, t1), ms(t1, t2), ms(t2, t3),
+                         ms(t3, t4), numAudioTokens, ms(t3, t4) / Double(max(numAudioTokens, 1)),
+                         ms(t4, t5),
+                         ms(t5, t6), generatedTokens.count, ms(t5, t6) / Double(max(generatedTokens.count, 1)),
+                         ms(t0, t6)))
         }
 
         // Decode tokens
