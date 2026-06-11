@@ -75,13 +75,16 @@ final class WordBoostingTokenizerTests: XCTestCase {
         XCTAssertEqual(tokenizer.encodeForWordBoosting("vocab JSON"), [2, 314, 1257, 140, 2, 228, 193, 210, 209])
         XCTAssertEqual(tokenizer.encodeForWordBoosting("should"), [2922])
 
+        // "Babble" segments into 3 pieces for a single word; at 3+ tokens
+        // per word the suggestion thresholds rate a phrase hard (see
+        // docs/inference/nemotron-asr-streaming.md).
         let suggestion = WordBoostingContext.suggestions(
             for: ["Babble"],
             vocabulary: NemotronVocabulary(idToToken: [:]),
             tokenizer: tokenizer
         )[0]
-        XCTAssertEqual(suggestion.difficulty, .moderate)
-        XCTAssertEqual(suggestion.suggestedBoost, 0.95)
+        XCTAssertEqual(suggestion.difficulty, .hard)
+        XCTAssertEqual(suggestion.suggestedBoost, 1.25)
     }
 }
 
@@ -364,7 +367,9 @@ final class WordBoostingSelectionTests: XCTestCase {
             vocabulary: vocab
         )!
         var state = context.initialState()
-        var logits: [Float] = [-10.0, 0.0, 1.0, 0.5]
+        // The first-token bonus equals the configured boost, so a boost of
+        // 10 overrides a logit gap smaller than 10 (here: 6 points).
+        var logits: [Float] = [-5.0, 0.0, 1.0, 0.5]
         let count = logits.count
 
         let selected = logits.withUnsafeMutableBufferPointer { buffer in
