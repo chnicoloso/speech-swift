@@ -49,7 +49,7 @@ final class WordBoostingVocabularyTests: XCTestCase {
 final class WordBoostingTokenizerTests: XCTestCase {
 
     func testSentencePieceUnigramChoosesHighestScoringPath() {
-        let tokenizer = NemotronSentencePieceUnigramTokenizer(pieces: [
+        let tokenizer = NemotronSentencePieceUnigramTokenizer(rawPieces: [
             (token: "<unk>", score: 0, type: 2),
             (token: "▁", score: -0.1, type: 1),
             (token: "V", score: -1.0, type: 1),
@@ -85,6 +85,29 @@ final class WordBoostingTokenizerTests: XCTestCase {
         )[0]
         XCTAssertEqual(suggestion.difficulty, .hard)
         XCTAssertEqual(suggestion.suggestedBoost, 1.25)
+    }
+
+    func testSuggestionTreatsShortSinglePieceTermAsEasy() {
+        // "AI" tokenizes to a single in-vocab piece. The previous heuristic
+        // routed any phrase with <=4 scalars to .hard / 1.25 regardless of
+        // token count — which over-fires for canonical short brand names
+        // (AI, EU, iOS, kHz). Single-piece coverage is the canonical .easy
+        // case.
+        let tokenizer = NemotronSentencePieceUnigramTokenizer(rawPieces: [
+            (token: "<unk>", score: 0, type: 2),
+            (token: "▁AI", score: -1.0, type: 1),
+        ])
+
+        let suggestions = WordBoostingContext.suggestions(
+            for: ["AI"],
+            vocabulary: NemotronVocabulary(idToToken: [:]),
+            tokenizer: tokenizer
+        )
+
+        XCTAssertEqual(suggestions.count, 1)
+        XCTAssertEqual(suggestions[0].tokenCount, 1)
+        XCTAssertEqual(suggestions[0].difficulty, .easy)
+        XCTAssertEqual(suggestions[0].suggestedBoost, 0.75)
     }
 }
 

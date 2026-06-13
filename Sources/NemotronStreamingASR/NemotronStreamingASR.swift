@@ -270,6 +270,16 @@ public class NemotronStreamingASRModel {
             mode: loadedWordBoostingTokenizer == nil ? .vocabFallback : .sentencePieceModel,
             path: loadedWordBoostingTokenizer?.url.path
         )
+        if loadedWordBoostingTokenizer == nil {
+            // Surface the degraded path explicitly — silent fallback to greedy
+            // vocab segmentation has been measured to disagree with real SPM
+            // tokenization on ~10/14 OOV terms (e.g. brand names, technical
+            // jargon), causing the boost trie to never fire on the divergent
+            // phrases.
+            AudioLog.modelLoading.warning(
+                "Nemotron word boosting tokenizer.model missing in cache; falling back to greedy vocab segmentation. Boost suggestions for OOV terms may diverge from the decoder's actual tokenization."
+            )
+        }
 
         // `.all` lets CoreML schedule the encoder onto the ANE (which is what
         // Python coremltools' `ComputeUnit.ALL` does). Encoder gains ~40% RTF

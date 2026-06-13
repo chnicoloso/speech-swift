@@ -1,32 +1,63 @@
 import Foundation
 import AudioCommon
 
+/// SentencePiece Unigram tokenizer used to encode word-boosting phrases into
+/// the exact token sequence the Nemotron RNN-T decoder emits.
+///
+/// Parses the SentencePiece model via the shared `AudioCommon.SentencePieceModel`
+/// reader (also used by OmnilingualASR, PersonaPlex, SpeechWakeWord) — this
+/// module owns only the encode-side Viterbi DP.
+///
+/// Why we ship this instead of greedy vocab segmentation: real SPM Unigram
+/// scores spans by piece log-probability, not by left-to-right longest match.
+/// On out-of-vocabulary brand/technical terms the two paths diverge on the
+/// first token (e.g. "voxtral" → ▁ vo x tra l with real SPM, ▁v o x tra l
+/// greedy), which would cause the boost trie to never fire.
 struct NemotronSentencePieceUnigramTokenizer: Sendable {
-    private struct Piece: Sendable {
-        let token: String
-        let score: Float
-        let type: Int
-    }
 
-    private let pieces: [Piece]
+    /// Hard cap on input phrase length (Unicode scalars).
+    ///
+    /// Unigram Viterbi is O(N²) over candidate spans, which is fine for the
+    /// vocabulary terms this API expects (names, technical terms, short
+    /// phrases). A clipboard-sized paste would otherwise spin the calling
+    /// thread for tens of seconds and allocate hundreds of MB of DP state,
+    /// so we refuse pathologically long inputs at the boundary.
+    static let maxPhraseScalars = 256
+
+    private let pieces: [AudioCommon.SentencePieceModel.Piece]
     private let tokenToId: [String: Int]
 
     init(modelURL: URL) throws {
-        let data = try Data(contentsOf: modelURL)
-        let pieces = try Self.parsePieces(from: data)
+        let model = try AudioCommon.SentencePieceModel(contentsOf: modelURL)
+        try self.init(pieces: model.pieces)
+    }
+
+    init(model: AudioCommon.SentencePieceModel) throws {
+        try self.init(pieces: model.pieces)
+    }
+
+    private init(pieces: [AudioCommon.SentencePieceModel.Piece]) throws {
         guard !pieces.isEmpty else {
             throw AudioModelError.modelLoadFailed(
-                modelId: modelURL.lastPathComponent,
+                modelId: "tokenizer.model",
                 reason: "SentencePiece model did not contain vocabulary pieces"
             )
         }
         self.pieces = pieces
-        self.tokenToId = Dictionary(uniqueKeysWithValues: pieces.enumerated().map { ($0.element.token, $0.offset) })
+        self.tokenToId = Dictionary(
+            uniqueKeysWithValues: pieces.enumerated().map { ($0.element.text, $0.offset) }
+        )
     }
 
-    init(pieces: [(token: String, score: Float, type: Int)]) {
-        self.pieces = pieces.map { Piece(token: $0.token, score: $0.score, type: $0.type) }
-        self.tokenToId = Dictionary(uniqueKeysWithValues: self.pieces.enumerated().map { ($0.element.token, $0.offset) })
+    /// Test-only initialiser that accepts raw `(text, score, type)` tuples.
+    init(rawPieces: [(token: String, score: Float, type: Int)]) {
+        let pieces = rawPieces.map {
+            AudioCommon.SentencePieceModel.Piece(text: $0.token, score: $0.score, type: Int32($0.type))
+        }
+        self.pieces = pieces
+        self.tokenToId = Dictionary(
+            uniqueKeysWithValues: pieces.enumerated().map { ($0.element.text, $0.offset) }
+        )
     }
 
     func encodeForWordBoosting(_ phrase: String) -> [Int]? {
@@ -34,28 +65,68 @@ struct NemotronSentencePieceUnigramTokenizer: Sendable {
         guard !normalized.isEmpty else { return nil }
 
         let scalars = Array(normalized.unicodeScalars)
+        guard scalars.count <= Self.maxPhraseScalars else { return nil }
+
+        // bestScores[i] = best log-prob of any segmentation reaching position i.
+        // backPointer[i] = (start, pieceId) that achieved bestScores[i]. We
+        // store back-pointers instead of copying the path array per accepted
+        // span — this keeps memory O(N) instead of O(N²) and avoids the
+        // O(N³) total path-copy cost the previous implementation incurred on
+        // long inputs.
         var bestScores = [Float](repeating: -.infinity, count: scalars.count + 1)
-        var bestPaths = Array(repeating: [Int](), count: scalars.count + 1)
+        var backPointer = [(start: Int, id: Int)?](repeating: nil, count: scalars.count + 1)
         bestScores[0] = 0
 
         for start in 0..<scalars.count where bestScores[start].isFinite {
             for end in (start + 1)...scalars.count {
                 let token = String(String.UnicodeScalarView(scalars[start..<end]))
-                guard let id = tokenToId[token], id != 0 else { continue }
+                guard let id = tokenToId[token] else { continue }
+                // Filter by piece type — never select <unk>, control, byte,
+                // or unused pieces as a Viterbi span. The previous gate
+                // `id != 0` assumed <unk> was always at index 0 (true for
+                // Nemotron 3.5 only) and silently allowed other special
+                // pieces to be selected.
+                guard !pieces[id].isControlOrUnknown else { continue }
 
                 let candidateScore = bestScores[start] + pieces[id].score
-                let candidatePath = bestPaths[start] + [id]
-                if candidateScore > bestScores[end]
-                    || (candidateScore == bestScores[end] && candidatePath.lexicographicallyPrecedes(bestPaths[end]))
-                {
+                let candidateBetter: Bool
+                if candidateScore > bestScores[end] {
+                    candidateBetter = true
+                } else if candidateScore == bestScores[end] {
+                    // Tie-break: prefer the path with the lexicographically
+                    // smaller token-id sequence, matching the previous
+                    // implementation's determinism guarantee. Comparing only
+                    // the most-recent (start, id) is sufficient because
+                    // bestScores[start] would already have selected the
+                    // lex-min prefix.
+                    if let existing = backPointer[end] {
+                        candidateBetter =
+                            id < existing.id ||
+                            (id == existing.id && start > existing.start)
+                    } else {
+                        candidateBetter = true
+                    }
+                } else {
+                    candidateBetter = false
+                }
+
+                if candidateBetter {
                     bestScores[end] = candidateScore
-                    bestPaths[end] = candidatePath
+                    backPointer[end] = (start: start, id: id)
                 }
             }
         }
 
-        let path = bestPaths[scalars.count]
-        return path.isEmpty ? nil : path
+        guard bestScores[scalars.count].isFinite else { return nil }
+
+        // Walk back-pointers to reconstruct the path.
+        var path: [Int] = []
+        var cursor = scalars.count
+        while cursor > 0, let bp = backPointer[cursor] {
+            path.append(bp.id)
+            cursor = bp.start
+        }
+        return path.isEmpty ? nil : path.reversed()
     }
 
     private func pieceText(for phrase: String) -> String {
@@ -66,121 +137,5 @@ struct NemotronSentencePieceUnigramTokenizer: Sendable {
             .joined(separator: " ")
         guard !normalized.isEmpty else { return "" }
         return "▁" + normalized.replacingOccurrences(of: " ", with: "▁")
-    }
-
-    private static func parsePieces(from data: Data) throws -> [Piece] {
-        var reader = ProtobufReader(data)
-        var pieces: [Piece] = []
-
-        while !reader.isAtEnd {
-            let key = try reader.readVarint()
-            let field = Int(key >> 3)
-            let wireType = Int(key & 0x7)
-
-            if field == 1, wireType == 2 {
-                let message = try reader.readLengthDelimited()
-                pieces.append(try parsePiece(from: message))
-            } else {
-                try reader.skip(wireType: wireType)
-            }
-        }
-
-        return pieces
-    }
-
-    private static func parsePiece(from data: Data) throws -> Piece {
-        var reader = ProtobufReader(data)
-        var token = ""
-        var score: Float = 0
-        var type = 1
-
-        while !reader.isAtEnd {
-            let key = try reader.readVarint()
-            let field = Int(key >> 3)
-            let wireType = Int(key & 0x7)
-
-            switch (field, wireType) {
-            case (1, 2):
-                token = String(data: try reader.readLengthDelimited(), encoding: .utf8) ?? ""
-            case (2, 5):
-                score = try reader.readFloat32()
-            case (3, 0):
-                type = Int(try reader.readVarint())
-            default:
-                try reader.skip(wireType: wireType)
-            }
-        }
-
-        return Piece(token: token, score: score, type: type)
-    }
-}
-
-private struct ProtobufReader {
-    private let bytes: [UInt8]
-    private var offset = 0
-
-    var isAtEnd: Bool { offset >= bytes.count }
-
-    init(_ data: Data) {
-        self.bytes = Array(data)
-    }
-
-    mutating func readVarint() throws -> UInt64 {
-        var result: UInt64 = 0
-        var shift: UInt64 = 0
-
-        while offset < bytes.count {
-            let byte = bytes[offset]
-            offset += 1
-            result |= UInt64(byte & 0x7F) << shift
-            if byte & 0x80 == 0 { return result }
-            shift += 7
-            if shift >= 64 { break }
-        }
-
-        throw AudioModelError.modelLoadFailed(modelId: "tokenizer.model", reason: "Malformed protobuf varint")
-    }
-
-    mutating func readLengthDelimited() throws -> Data {
-        let length = Int(try readVarint())
-        guard offset + length <= bytes.count else {
-            throw AudioModelError.modelLoadFailed(modelId: "tokenizer.model", reason: "Malformed protobuf length")
-        }
-        defer { offset += length }
-        return Data(bytes[offset..<(offset + length)])
-    }
-
-    mutating func readFloat32() throws -> Float {
-        guard offset + 4 <= bytes.count else {
-            throw AudioModelError.modelLoadFailed(modelId: "tokenizer.model", reason: "Malformed protobuf float")
-        }
-        let bits = UInt32(bytes[offset])
-            | (UInt32(bytes[offset + 1]) << 8)
-            | (UInt32(bytes[offset + 2]) << 16)
-            | (UInt32(bytes[offset + 3]) << 24)
-        offset += 4
-        return Float(bitPattern: bits)
-    }
-
-    mutating func skip(wireType: Int) throws {
-        switch wireType {
-        case 0:
-            _ = try readVarint()
-        case 1:
-            offset += 8
-        case 2:
-            _ = try readLengthDelimited()
-        case 5:
-            offset += 4
-        default:
-            throw AudioModelError.modelLoadFailed(
-                modelId: "tokenizer.model",
-                reason: "Unsupported protobuf wire type \(wireType)"
-            )
-        }
-
-        guard offset <= bytes.count else {
-            throw AudioModelError.modelLoadFailed(modelId: "tokenizer.model", reason: "Malformed protobuf skip")
-        }
     }
 }

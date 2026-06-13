@@ -162,11 +162,18 @@ struct WordBoostingContext: Sendable {
         let boost: Float
         let reason: String
 
+        // `hasShortShape` only signals difficulty when combined with
+        // fragmentation. A short phrase that the vocabulary already covers
+        // in a SINGLE piece (e.g. "AI", "iOS", "kHz") is the canonical
+        // easy case — boosting it as `.hard / 1.25` over-fires and lets a
+        // 1-token brand name override unrelated audio. Gate the
+        // short-shape branch on `bestTokenCount > 1` so the .easy fall-
+        // through catches single-piece phrases.
         if bestTokenCount >= 6 || tokensPerWord >= 5 {
             difficulty = .hard
             boost = 1.25
             reason = "Phrase is highly fragmented by the Nemotron vocabulary"
-        } else if bestTokenCount >= 4 || tokensPerWord >= 3 || hasShortShape {
+        } else if bestTokenCount >= 4 || tokensPerWord >= 3 || (hasShortShape && bestTokenCount > 1) {
             difficulty = .hard
             boost = 1.25
             reason = hasShortShape
@@ -268,7 +275,6 @@ struct WordBoostingTree: Sendable {
         var nodeScore: Float = 0
         var backoffScore: Float = 0
         var isEnd: Bool = false
-        var tokens: [Int] = []
     }
 
     private var nodes: [Node] = [Node()]
@@ -299,10 +305,6 @@ struct WordBoostingTree: Sendable {
         }
     }
 
-    func tokens(at node: Int) -> [Int] {
-        nodes[min(max(0, node), nodes.count - 1)].tokens
-    }
-
     private mutating func add(phrase: [Int], contextScore: Float, depthScaling: Float) {
         var current = 0
         for (index, token) in phrase.enumerated() {
@@ -320,9 +322,7 @@ struct WordBoostingTree: Sendable {
             } else {
                 next = nodes.count
                 nodes[current].next[token] = next
-                var node = Node(tokenScore: candidateTokenScore)
-                node.tokens = nodes[current].tokens + [token]
-                nodes.append(node)
+                nodes.append(Node(tokenScore: candidateTokenScore))
             }
 
             nodes[next].nodeScore = nodes[current].nodeScore + nodes[next].tokenScore

@@ -126,7 +126,7 @@ Word boosting is a nudge, not a replacement rule. A phrase only wins when its to
 | 0.25-0.5 | Very gentle bias for common words or large phrase lists |
 | 0.75 | Suggested starting point for easy custom vocabulary |
 | 0.95 | Moderate bias for product names, people, and uncommon technical terms |
-| 1.25 | Highest automatic suggestion for short, fragmented, or unencodable phrases |
+| 1.25 | Highest automatic suggestion for fragmented or unencodable phrases (4+ pieces or 3+ pieces per word). Short phrases (≤4 characters) only get this boost when they fragment — a short term the vocabulary already covers in a single piece (e.g. `AI`, `iOS`, `kHz`) is treated as easy. |
 | 5.0+ | Diagnostic/risky; can force wrong words into the transcript |
 
 For example, if the speaker says a product name but the baseline often hears nearby common words, try:
