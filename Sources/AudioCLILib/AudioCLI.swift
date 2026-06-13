@@ -2,7 +2,7 @@ import ArgumentParser
 
 public struct AudioCLI: ParsableCommand {
     public static let configuration = CommandConfiguration(
-        commandName: "audio",
+        commandName: "speech",
         abstract: "AI speech models for Apple Silicon",
         subcommands: [
             TranscribeCommand.self,
@@ -17,6 +17,9 @@ public struct AudioCLI: ParsableCommand {
             EmbedSpeakerCommand.self,
             DenoiseCommand.self,
             SeparateCommand.self,
+            ComposeCommand.self,
+            SA3ParityCommand.self,
+            UpsampleCommand.self,
             KokoroCommand.self,
             Qwen3TTSCoreMLCommand.self,
             VibeVoiceCommand.self,
