@@ -26,8 +26,12 @@ public extension HibikiTranslateModel {
 
     /// Translate source-language speech to English speech (offline).
     ///
-    /// Hibiki is **synchronous 1:1**: each Mimi frame of input (80 ms) produces
-    /// exactly one Mimi frame of output. So `output_duration ≈ input_duration`.
+    /// Output length is **variable**, driven by sampled EOS: Hibiki emits
+    /// text-PAD while it accumulates source context, then content text +
+    /// audio, then text-EOS. Output runs ~1.5× the source duration on
+    /// FLEURS-style inputs, capped at `max(tSrc * 5/2, tSrc + 20)` steps
+    /// (~2.5× source) as a safety bound. Callers should not assume
+    /// `output_duration == input_duration`.
     ///
     /// - Parameters:
     ///   - sourceAudio: PCM samples at 24 kHz, mono.

@@ -55,12 +55,44 @@ Target-language audio (24 kHz)
 | Depformer dim_feedforward | 2816 (depformer.dim×2/3×4.125) | **4096 (depformer.dim×2/3×6)** |
 | Tokenizer | SPM 32k (tokenizer_spm_32k_3.model) | **SPM 48k (tokenizer_spm_48k_multi6_2.model)** |
 
-## Synchronous 1:1 generation
+## Decode loop
 
-Hibiki is **synchronous**: each Mimi frame of input (80 ms) produces exactly
-one Mimi frame of output. The generation loop runs `tSrc` steps where
-`tSrc = ceil(input_pcm_len / 1920)`. Output duration ≈ input duration. There
-is no separate prefill phase (no voice prompt, no system prompt).
+Hibiki streams source Mimi frames (12.5 Hz / 80 ms each) into the temporal
+transformer. At each step the model samples one text token and 16 target
+audio codes (via the depformer), and feeds them back as autoregressive
+input on the next step. There is no separate prefill phase (no voice
+prompt, no system prompt).
+
+Hibiki emits text-PAD tokens (id 3) while it accumulates enough source
+context to translate, then begins emitting content text tokens and the
+matching target audio, and finally samples a text-EOS (id 2) to signal
+end of utterance. The Swift driver runs **until EOS is sampled past the
+source window**, with a `max(tSrc * 5/2, tSrc + 20)`-step safety cap.
+
+Empirically the output runs ~1.5× the source duration on FLEURS-style
+inputs (e.g. 3.54 s FR source → 4.96 s EN output). Callers can no longer
+assume `output_duration == input_duration`; expect output length up to
+~2.5× source.
+
+Three pieces of the decode loop are non-obvious and were the cause of the
+quality bug fixed in PR #238:
+
+1. **Uniform `step` read with init-token substitution.** All 33 streams
+   (text + 16 target audio + 16 source audio) are read at `cache[step]`
+   each iteration, with the init token substituted when
+   `step <= delays[k]`. Mirrors upstream Moshi `lm.py:698-702`
+   (`positions = offsets % CT`).
+2. **Write generated text + target codes at `step + 1`.** Upstream
+   increments the offset *before* the cache scatter (`lm.py:759-772`).
+   Writing at the same `step` index leaves the autoregressive read-slot
+   at init forever — the model then runs effectively unconditioned on
+   its own previous output and produces fluent English that has no
+   relationship to the source.
+3. **`text_emb` row-2 (EOS) is aliased to row-3 (PAD)** at weight-load
+   time (`HibikiWeightLoading.swift`), mirroring Kyutai's
+   `loaders.py:312` "implicitly replace early EOS with PAD" patch. Any
+   EOS sampled during the audio-streaming window is harmless via this
+   alias; EOS sampled after the source ends terminates the loop.
 
 ## Files
 
@@ -94,8 +126,11 @@ try WAVWriter.write(samples: englishAudio, sampleRate: 24000, to: output)
 CLI:
 
 ```bash
-audio audio-translate input_fr.wav --output translated_en.wav --source-lang fr
-audio audio-translate input.wav --quantization 8bit --verbose --transcript
+speech audio-translate input_fr.wav --output translated_en.wav --source-lang fr
+speech audio-translate input.wav --quantization 8bit --verbose --transcript
+
+# Deterministic / reproducible runs (matches the CI canaries):
+HIBIKI_GREEDY=1 speech audio-translate input_fr.wav -o out.wav --source-lang fr
 ```
 
 ## Conversion
@@ -120,24 +155,39 @@ or `kyutai/hibiki-zero-3b-pytorch-bf16` and produces MLX-compatible safetensors:
 - `tokenizer_spm_48k_multi6_2.model`
 - `config.json`
 
+## Translation quality
+
+Greedy outputs (`HIBIKI_GREEDY=1`) on the canary E2E test fixtures:
+
+| Source | Reference EN | Hibiki output | Keywords hit |
+|---|---|---|---|
+| FR — fleurs_fr.wav (3.54 s) | "Think of the ski route as a similar hiking route." | "so it's a ski route." | `ski`, `route` |
+| ES — hibiki_official_es_5s.wav (5.00 s) | "Gentlemen, the data is worrying." | "gentlemen, the data is worrying." | `gentlemen`, `data`, `worrying` |
+| PT — fleurs_pt.wav (5.16 s) | "It is the fifth CEP for Martelly in four years." | "the fifth c is p of the martyr." | `fifth` |
+| DE — fleurs_de.wav (5.40 s) | "It didn't seem sensible to me; it certainly wasn't fair." | "that didn't seem to me to be useful." | `seem` |
+
+FR and ES are **strict** in CI — `testFrenchToEnglishTranslation` and
+`testSpanishToEnglishTranslation` fail if zero keywords match. PT and DE
+are warn-only; promote with `HIBIKI_STRICT_ALL=1`, demote FR/ES with
+`HIBIKI_LENIENT=1`.
+
+Sampled mode (default, `HIBIKI_GREEDY` unset) is noticeably noisier than
+greedy. Reproducible runs and CI canaries use greedy.
+
 ## Known limitations
 
-- **Translation quality is broken — open bug.** A closed-loop round-trip test
-  (`testClosedLoopTTSToHibikiToASR`: known FR text → Qwen3TTS → FR audio →
-  Hibiki → EN audio → Parakeet ASR) produces 0/3 keyword hits on simple
-  in-distribution sentences. Decoding Hibiki's inner-monologue text tokens
-  (which the model emits at 12.5 Hz alongside the audio codes) reveals that
-  the temporal transformer is producing valid English subwords that are
-  **completely unrelated to the source content** — meaning the audio
-  embeddings aren't conditioning the LM as intended.
-  The structural pipeline (weight load, forward shape, durations, RTF) is
-  correct end-to-end. The bug is in the audio-conditioning path. Most likely
-  suspects: GQA KV-cache head broadcast layout, or a per-stream embedding
-  scaling upstream Moshi applies that this port is missing. Needs comparison
-  against Kyutai's `hibiki-rs` reference output to isolate further.
-- **`translateStream()` is single-chunk** — The streaming entry point currently
-  wraps `translate()` and emits one final `AudioChunk`. True per-chunk Mimi
-  streaming decode is a v2 follow-up.
+- **FLEURS Spanish is out-of-distribution.** FLEURS recordings are 16 kHz
+  human-narrated news clips; Hibiki Zero was trained on 24 kHz TTS-generated
+  speech (11labs, cartesia, gradium). Both Python upstream and the Swift
+  port produce degenerate output on FLEURS-ES — Python emits 1643 steps
+  (~131 s) of broken audio without sampling EOS. The ES test fixture is a
+  5 s trimmed excerpt from Kyutai's official samples space
+  (`europarl_st/5dc1d533`, 24 kHz TTS) which matches the training
+  distribution and produces clean English.
+- **`translateStream()` is single-chunk** — The streaming entry point
+  currently wraps `translate()` and emits one final `AudioChunk` once
+  full-utterance generation completes. True per-chunk Mimi streaming
+  decode is a v2 follow-up.
 - **No SentencePiece decoder** — `translate()` returns text token IDs but
   doesn't decode them through `tokenizer_spm_48k_multi6_2.model`. The CLI
   `--transcript` flag prints raw token IDs.

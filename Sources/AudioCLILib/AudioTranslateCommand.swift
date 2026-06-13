@@ -16,7 +16,7 @@ public struct AudioTranslateCommand: ParsableCommand {
     @Option(name: .shortAndLong, help: "Output WAV file path.")
     public var output: String = "translated.wav"
 
-    @Option(name: .long, help: "Source language hint (fr, es, pt, de). Hibiki Zero auto-detects; this is metadata only.")
+    @Option(name: .long, help: "Source language hint (fr, es, pt, de). Hibiki Zero auto-detects; this is metadata only. Default: fr. FR and ES are strict E2E canaries; PT/DE outputs are content-faithful but lower keyword recall.")
     public var sourceLang: String = "fr"
 
     @Option(name: .long, help: "Quantization variant: 4bit (default) or 8bit.")
@@ -25,13 +25,13 @@ public struct AudioTranslateCommand: ParsableCommand {
     @Option(name: .long, help: "HuggingFace model id (overrides --quantization).")
     public var modelId: String?
 
-    @Flag(name: .long, help: "Pre-compile temporal transformer (warmup). Currently no-op for Hibiki driver.")
+    @Flag(name: .long, help: "Run the temporal transformer warm-up pass before translating (one-time JIT/cache priming).")
     public var compile: Bool = false
 
     @Flag(name: .long, help: "Print per-phase timings.")
     public var verbose: Bool = false
 
-    @Flag(name: .long, help: "Print model's inner monologue (English transcript).")
+    @Flag(name: .long, help: "Print model's inner monologue (raw SPM token IDs; SPM decode wiring is a follow-up).")
     public var transcript: Bool = false
 
     public init() {}
