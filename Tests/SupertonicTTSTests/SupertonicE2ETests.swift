@@ -87,4 +87,32 @@ final class SupertonicE2ETests: XCTestCase {
         XCTAssertGreaterThanOrEqual(matched.count, 2,
             "At least 2 of \(keywords) should be transcribed from Supertonic speech: \"\(transcription)\"")
     }
+
+    /// Multilingual synthesis across languages + voices. The G2P-free front-end has no per-language
+    /// phonemizer (NFKD + index only), so every language goes through the identical path — each must
+    /// produce non-silent, sensibly-sized 44.1 kHz audio. (Intelligibility is covered by the English
+    /// TTS→ASR roundtrip above; this asserts the multilingual path itself, CoreML-only, no MLX/ASR.)
+    func testMultilingualSynthesis() async throws {
+        let tts = try await model()
+        struct Case { let lang: String; let voice: String; let text: String }
+        let cases = [
+            Case(lang: "de", voice: "M2", text: "Guten Morgen, wie geht es Ihnen heute?"),
+            Case(lang: "es", voice: "F3", text: "Hola, esto es una prueba de la voz."),
+            Case(lang: "fr", voice: "M3", text: "Bonjour, ceci est un test de la voix."),
+            Case(lang: "ru", voice: "F4", text: "Привет, это проверка голоса."),
+            Case(lang: "it", voice: "M4", text: "Ciao, questa è una prova vocale."),
+            Case(lang: "ko", voice: "F5", text: "안녕하세요, 음성 테스트입니다."),
+        ]
+        for c in cases {
+            let audio = try tts.synthesize(text: c.text, voice: c.voice, language: c.lang)
+            let dur = Double(audio.count) / 44100.0
+            let rms = sqrt(audio.map { $0 * $0 }.reduce(0, +) / Float(audio.count))
+            print("[\(c.lang)/\(c.voice)] \(audio.count) samples (\(String(format: "%.2f", dur))s) rms=\(String(format: "%.4f", rms))")
+            XCTAssertGreaterThan(audio.count, 1000, "\(c.lang): should produce audio")
+            XCTAssertGreaterThan(dur, 0.3, "\(c.lang): plausible duration")
+            XCTAssertLessThan(dur, 12.0, "\(c.lang): plausible duration")
+            XCTAssertGreaterThan(rms, 0.001, "\(c.lang): audio should not be silence")
+            XCTAssertLessThan(audio.map { abs($0) }.max() ?? 0, 1.001, "\(c.lang): no clipping")
+        }
+    }
 }
