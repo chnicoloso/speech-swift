@@ -43,9 +43,10 @@ public final class Qwen3DenseChat: @unchecked Sendable {
         return Qwen3DenseChat(dc: config, tokenizer: tokenizer, model: model)
     }
 
-    /// Download an MLX model from HuggingFace, then load it.
+    /// Download an MLX model from HuggingFace, then load it. Defaults to the int5 export (best
+    /// quality/size for on-device chat); pass `…-MLX-4bit` for a smaller, lower-RAM variant.
     public static func fromPretrained(
-        modelId: String = "aufklarer/Qwen3-4B-Instruct-2507-MLX-4bit",
+        modelId: String = "aufklarer/Qwen3-4B-Instruct-2507-MLX-5bit",
         cacheDir: URL? = nil,
         offlineMode: Bool = false,
         progressHandler: ((Double, String) -> Void)? = nil
