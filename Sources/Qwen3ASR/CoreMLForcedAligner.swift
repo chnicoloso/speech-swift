@@ -225,13 +225,6 @@ public final class CoreMLForcedAligner {
         )
         let t4 = profile ? CFAbsoluteTimeGetCurrent() : 0
 
-        if ProcessInfo.processInfo.environment["ALIGN_NAN_PROBE"] == "1" {
-            Self.dumpNaNStats(label: "audioEmbeds (encoder out)", array: audioEmbeds,
-                              firstRows: 3, rowSize: hiddenSize)
-            Self.dumpNaNStats(label: "tokenEmbeds (after splice)", array: tokenEmbeds,
-                              firstRows: 3, rowSize: hiddenSize)
-        }
-
         // 6. One forward pass through text_decoder + classify head. The
         // causal mask is baked into the exported graph as a constant.
         let logits = try textDecoder.run(inputsEmbeds: tokenEmbeds)
@@ -239,32 +232,8 @@ public final class CoreMLForcedAligner {
 
         // 8. Extract argmax at <timestamp> positions.
         let absolutePositions = slotted.timestampPositions.map { $0 + slottedStart }
-        if ProcessInfo.processInfo.environment["ALIGN_NAN_PROBE"] == "1" {
-            Self.dumpLogitsAtPositions(logits: logits, positions: absolutePositions,
-                                        classifyNum: classifyNum, top: 5)
-        }
-        var rawIndices = Self.argmaxAtPositions(
+        let rawIndices = Self.argmaxAtPositions(
             logits: logits, positions: absolutePositions, classifyNum: classifyNum)
-
-        // Some virtualized cpuOnly runners execute the shipped compiled
-        // decoder as an all-zero output buffer. If the source package is
-        // available, let CoreML compile that package locally and try once more.
-        if textDecoder.shouldRetryFromSourcePackage(rawIndices: rawIndices),
-           let retryLogits = try textDecoder.runSourcePackageFallback(inputsEmbeds: tokenEmbeds) {
-            if ProcessInfo.processInfo.environment["ALIGN_DEBUG"] == "1" {
-                print("[coreml-align-debug] compiled decoder returned all-zero timestamps; "
-                    + "retrying with source mlpackage")
-            }
-            if ProcessInfo.processInfo.environment["ALIGN_NAN_PROBE"] == "1" {
-                Self.dumpLogitsAtPositions(logits: retryLogits, positions: absolutePositions,
-                                            classifyNum: classifyNum, top: 5)
-            }
-            let retryRawIndices = Self.argmaxAtPositions(
-                logits: retryLogits, positions: absolutePositions, classifyNum: classifyNum)
-            if !Self.shouldRetryDecoderFromSourcePackage(rawIndices: retryRawIndices) {
-                rawIndices = retryRawIndices
-            }
-        }
         let t6 = profile ? CFAbsoluteTimeGetCurrent() : 0
 
         // 9. LIS correction + pair into [AlignedWord].
@@ -401,71 +370,6 @@ public final class CoreMLForcedAligner {
         }
     }
 
-    static func dumpNaNStats(label: String, array: MLMultiArray, firstRows: Int, rowSize: Int) {
-        let count = array.count
-        var nans = 0, infs = 0, finites = 0
-        var mn = Float.infinity, mx = -Float.infinity
-        switch array.dataType {
-        case .float32:
-            let p = array.dataPointer.assumingMemoryBound(to: Float.self)
-            for i in 0..<count {
-                let v = p[i]
-                if v.isNaN { nans += 1 }
-                else if !v.isFinite { infs += 1 }
-                else { finites += 1; mn = min(mn, v); mx = max(mx, v) }
-            }
-        case .float16:
-            let p = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            for i in 0..<count {
-                let v = Float(p[i])
-                if v.isNaN { nans += 1 }
-                else if !v.isFinite { infs += 1 }
-                else { finites += 1; mn = min(mn, v); mx = max(mx, v) }
-            }
-        default: return
-        }
-        print("[NAN-PROBE] \(label) shape=\(array.shape.map{$0.intValue}) "
-            + "strides=\(array.strides.map{$0.intValue}) "
-            + "dtype=\(array.dataType.rawValue) "
-            + "nan=\(nans) inf=\(infs) finite=\(finites) "
-            + "min=\(mn) max=\(mx)")
-    }
-
-    static func dumpLogitsAtPositions(logits: MLMultiArray, positions: [Int],
-                                       classifyNum: Int, top: Int) {
-        let shape = logits.shape.map { $0.intValue }
-        guard shape.count == 3 else { return }
-        let strides = logits.strides.map { $0.intValue }
-        let posStride = strides[1]
-        let classStride = strides[2]
-        let load: (Int) -> Float
-        switch logits.dataType {
-        case .float32:
-            let p = logits.dataPointer.assumingMemoryBound(to: Float.self)
-            load = { i in p[i] }
-        case .float16:
-            let p = logits.dataPointer.assumingMemoryBound(to: Float16.self)
-            load = { i in Float(p[i]) }
-        default: return
-        }
-        for (i, pos) in positions.enumerated().prefix(5) {
-            let base = pos * posStride
-            var stats = (nan: 0, inf: 0, finite: 0, mn: Float.infinity, mx: -Float.infinity)
-            for c in 0..<classifyNum {
-                let v = load(base + c * classStride)
-                if v.isNaN { stats.nan += 1 }
-                else if !v.isFinite { stats.inf += 1 }
-                else { stats.finite += 1; stats.mn = min(stats.mn, v); stats.mx = max(stats.mx, v) }
-            }
-            var idx = Array(0..<classifyNum)
-            idx.sort { load(base + $0 * classStride) > load(base + $1 * classStride) }
-            let topIdx = idx.prefix(top).map { c in "\(c)=\(load(base + c * classStride))" }
-                .joined(separator: " ")
-            print("[NAN-PROBE] logits[pos=\(pos) (#\(i))] nan=\(stats.nan) inf=\(stats.inf) "
-                + "finite=\(stats.finite) min=\(stats.mn) max=\(stats.mx) top=\(topIdx)")
-        }
-    }
-
     static func argmaxAtPositions(
         logits: MLMultiArray, positions: [Int], classifyNum: Int
     ) -> [Int] {
@@ -509,11 +413,6 @@ public final class CoreMLForcedAligner {
             return Array(repeating: 0, count: positions.count)
         }
         return out
-    }
-
-    static func shouldRetryDecoderFromSourcePackage(rawIndices: [Int]) -> Bool {
-        guard !rawIndices.isEmpty else { return false }
-        return rawIndices.allSatisfy { $0 == 0 }
     }
 }
 
@@ -591,22 +490,14 @@ public final class CoreMLForcedAlignerEncoder {
         return EncodedAudio(embeddings: emb, outputLength: outLen)
     }
 
-    static func resolveURLs(in directory: URL, name: String) -> (compiled: URL?, package: URL?) {
+    static func resolveURL(in directory: URL, name: String) throws -> URL {
         let compiled = directory.appendingPathComponent("\(name).mlmodelc", isDirectory: true)
         let pkg = directory.appendingPathComponent("\(name).mlpackage", isDirectory: true)
-        let compiledURL = FileManager.default.fileExists(atPath: compiled.path) ? compiled : nil
-        let packageURL = FileManager.default.fileExists(atPath: pkg.path) ? pkg : nil
-        return (compiledURL, packageURL)
-    }
-
-    static func resolveURL(in directory: URL, name: String) throws -> URL {
-        let urls = resolveURLs(in: directory, name: name)
-        if let compiled = urls.compiled { return compiled }
-        if let pkg = urls.package { return pkg }
+        if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+        if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
         throw AudioModelError.modelLoadFailed(
             modelId: name,
-            reason: "Neither \(directory.appendingPathComponent("\(name).mlmodelc").path) "
-            + "nor \(directory.appendingPathComponent("\(name).mlpackage").path) exists")
+            reason: "Neither \(compiled.path) nor \(pkg.path) exists")
     }
 }
 
@@ -723,39 +614,20 @@ public final class CoreMLForcedAlignerEmbedding {
 
 public final class CoreMLForcedAlignerDecoder {
     private let model: MLModel
-    private let sourcePackageURL: URL?
-    private let computeUnits: MLComputeUnits
-    private let fallbackLock = NSLock()
-    private var sourcePackageModel: MLModel?
-    private var sourcePackageCompiledURL: URL?
     public let fixedT: Int
 
-    public init(
-        model: MLModel,
-        fixedT: Int = 768,
-        sourcePackageURL: URL? = nil,
-        computeUnits: MLComputeUnits = .all
-    ) {
+    public init(model: MLModel, fixedT: Int = 768) {
         self.model = model
         self.fixedT = fixedT
-        self.sourcePackageURL = sourcePackageURL
-        self.computeUnits = computeUnits
     }
 
     public static func load(
         from directory: URL,
         computeUnits: MLComputeUnits = CoreMLComputeUnitsResolver.resolved(default: .all)
     ) throws -> CoreMLForcedAlignerDecoder {
-        let resolvedComputeUnits = CoreMLComputeUnitsResolver.resolved(default: computeUnits)
-        let urls = CoreMLForcedAlignerEncoder.resolveURLs(in: directory, name: "text_decoder")
-        guard let url = urls.compiled ?? urls.package else {
-            throw AudioModelError.modelLoadFailed(
-                modelId: "text_decoder",
-                reason: "Neither \(directory.appendingPathComponent("text_decoder.mlmodelc").path) "
-                + "nor \(directory.appendingPathComponent("text_decoder.mlpackage").path) exists")
-        }
+        let url = try CoreMLForcedAlignerEncoder.resolveURL(in: directory, name: "text_decoder")
         let cfg = MLModelConfiguration()
-        cfg.computeUnits = resolvedComputeUnits
+        cfg.computeUnits = computeUnits
         let model = try MLModel(contentsOf: url, configuration: cfg)
         // Read fixedT from the model's declared input shape so a runtime
         // override (T=512 / T=1024) doesn't need a separate code path.
@@ -765,13 +637,7 @@ public final class CoreMLForcedAlignerDecoder {
             let shape = constraint.shape.map { $0.intValue }
             if shape.count == 3 && shape[1] > 0 { fixedT = shape[1] }
         }
-        let sourcePackageURL = urls.compiled == nil ? nil : urls.package
-        return CoreMLForcedAlignerDecoder(
-            model: model,
-            fixedT: fixedT,
-            sourcePackageURL: sourcePackageURL,
-            computeUnits: resolvedComputeUnits
-        )
+        return CoreMLForcedAlignerDecoder(model: model, fixedT: fixedT)
     }
 
     public func warmUp() throws {
@@ -782,40 +648,6 @@ public final class CoreMLForcedAlignerDecoder {
     }
 
     public func run(inputsEmbeds: MLMultiArray) throws -> MLMultiArray {
-        return try predict(model: model, inputsEmbeds: inputsEmbeds)
-    }
-
-    func runSourcePackageFallback(inputsEmbeds: MLMultiArray) throws -> MLMultiArray? {
-        guard let sourcePackageURL else { return nil }
-        let fallback = try loadSourcePackageModel(from: sourcePackageURL)
-        return try predict(model: fallback, inputsEmbeds: inputsEmbeds)
-    }
-
-    func shouldRetryFromSourcePackage(rawIndices: [Int]) -> Bool {
-        sourcePackageURL != nil
-            && computeUnits == .cpuOnly
-            && CoreMLForcedAligner.shouldRetryDecoderFromSourcePackage(rawIndices: rawIndices)
-    }
-
-    private func loadSourcePackageModel(from url: URL) throws -> MLModel {
-        fallbackLock.lock()
-        defer { fallbackLock.unlock() }
-        if let sourcePackageModel { return sourcePackageModel }
-        let cfg = MLModelConfiguration()
-        cfg.computeUnits = computeUnits
-        let compiledURL: URL
-        if let sourcePackageCompiledURL {
-            compiledURL = sourcePackageCompiledURL
-        } else {
-            compiledURL = try MLModel.compileModel(at: url)
-            sourcePackageCompiledURL = compiledURL
-        }
-        let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
-        sourcePackageModel = model
-        return model
-    }
-
-    private func predict(model: MLModel, inputsEmbeds: MLMultiArray) throws -> MLMultiArray {
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "inputs_embeds": MLFeatureValue(multiArray: inputsEmbeds),
         ])
